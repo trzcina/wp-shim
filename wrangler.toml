@@ -1,0 +1,35 @@
+name = "siechnice-wp-shim"
+main = "index.js"
+compatibility_date = "2025-06-01"
+
+# Worker łapie tylko API WordPressa i stronę główną (nagłówek wykrywania API).
+# Reszta serwisu idzie prosto do Bolta.
+routes = [
+  { pattern = "siechnice.com.pl/wp-json*", zone_name = "siechnice.com.pl" },
+  { pattern = "siechnice.com.pl/", zone_name = "siechnice.com.pl" },
+  # Jeśli serwis odpowiada też pod www, odkomentuj:
+  # { pattern = "www.siechnice.com.pl/wp-json*", zone_name = "siechnice.com.pl" },
+]
+
+# Utwórz KV "SHIM" w panelu (Storage & Databases → KV), skopiuj jego ID i wklej poniżej.
+kv_namespaces = [
+  { binding = "SHIM", id = "WKLEJ_ID_KV" },
+]
+
+[vars]
+SITE_URL = "https://siechnice.com.pl"
+SITE_TITLE = "Siechnice.com.pl"
+WP_USER = "linkhouse"
+# Adres artykułu w Bolcie; {slug} i {id} są podmieniane.
+POST_URL_TEMPLATE = "https://siechnice.com.pl/entry/{slug}"
+# "false" = etap rozpoznania: wpis zapisany, publikacja odrzucona (503).
+ACCEPT_PUBLISH = "false"
+# "all" = loguj wszystko, "auth" = tylko żądania z loginem (mniej śmieci od botów)
+LOG_MODE = "all"
+# Kategorie pokazywane platformom (id muszą być liczbami).
+CATEGORIES = '[{"id":1,"name":"Aktualności","slug":"aktualnosci"},{"id":2,"name":"Artykuły sponsorowane","slug":"artykuly-sponsorowane"}]'
+
+# UWAGA: przy każdym wdrożeniu z GitHuba te [vars] nadpisują zmienne z panelu,
+# więc zmieniaj je tutaj, w repozytorium.
+# Sekrety ustaw w panelu (Settings → Variables and Secrets → typ Secret),
+# deploy ich nie rusza: WP_APP_PASSWORD, ADMIN_TOKEN
