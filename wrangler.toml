@@ -2,18 +2,17 @@ name = "siechnice-wp-shim"
 main = "index.js"
 compatibility_date = "2025-06-01"
 
-# Worker łapie tylko API WordPressa i stronę główną (nagłówek wykrywania API).
-# Reszta serwisu idzie prosto do Bolta.
+# Worker łapie tylko API WordPressa. Strona główna NIE idzie przez Workera (limit żądań, ryzyko awarii) —
+# znacznik wykrywania API (<link rel="https://api.w.org/">) dokłada szablon Bolta w <head>.
 routes = [
   { pattern = "siechnice.com.pl/wp-json*", zone_name = "siechnice.com.pl" },
-  { pattern = "siechnice.com.pl/", zone_name = "siechnice.com.pl" },
   # Jeśli serwis odpowiada też pod www, odkomentuj:
   # { pattern = "www.siechnice.com.pl/wp-json*", zone_name = "siechnice.com.pl" },
 ]
 
 # Utwórz KV "SHIM" w panelu (Storage & Databases → KV), skopiuj jego ID i wklej poniżej.
 kv_namespaces = [
-  { binding = "SHIM", id = "WKLEJ_ID_KV" },
+  { binding = "SHIM", id = "7acc8c328c1f4e889020e554e8fdf17e" },
 ]
 
 [vars]
@@ -21,7 +20,7 @@ SITE_URL = "https://siechnice.com.pl"
 SITE_TITLE = "Siechnice.com.pl"
 WP_USER = "linkhouse"
 # Adres artykułu w Bolcie; {slug} i {id} są podmieniane.
-POST_URL_TEMPLATE = "https://siechnice.com.pl/entry/{slug}"
+POST_URL_TEMPLATE = "https://siechnice.com.pl/news/{slug}"
 # "false" = etap rozpoznania: wpis zapisany, publikacja odrzucona (503).
 ACCEPT_PUBLISH = "false"
 # "all" = loguj wszystko, "auth" = tylko żądania z loginem (mniej śmieci od botów)
