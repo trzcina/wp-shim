@@ -462,7 +462,7 @@ async function savePostAndRespond(c, rec, okStatus) {
     rec.status = 'publish';
     delete rec.bolt_error;
     await storePost(env, rec);
-    c.ctx.waitUntil(zglosDoSkrzynki(c, rec, 'publikacja').catch((e) => console.error('skrzynka', e)));
+    c.ctx.waitUntil(poPublikacji(c, rec).catch((e) => console.error('skrzynka', e)));
     const view = postView(rec, c);
     return json(view, okStatus, okStatus === 201 ? { Location: `${c.site}/wp-json/wp/v2/posts/${rec.id}` } : {});
   }
@@ -643,6 +643,32 @@ async function publikujWBolcie(c, rec) {
     await env.SHIM.delete(klucz);
     throw e;
   }
+}
+
+/**
+ * Po publikacji: zamknij w skrzynce kartę zlecenia z maila (klucz linkhouse:/whitepress:, tytuł zawiera tytuł
+ * artykułu) — „Zrobione” archiwizuje też wątek. Nie ma takiej karty (albo nie udało się) → osobna karta, żeby
+ * publikacja nie przeszła niezauważona.
+ */
+async function poPublikacji(c, rec) {
+  const { env } = c;
+  if (!env.SKRZYNKA_TOKEN || (rec.bolt && rec.bolt.powtorka)) return;
+  try {
+    const res = await fetch((env.SKRZYNKA_URL || 'https://skrzynka.siechnice.com.pl') + '/api/zadania/zamknij', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${env.SKRZYNKA_TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ szukaj: String(rec.title).slice(0, 80), komentarz: `Opublikowane automatycznie: ${rec.bolt && rec.bolt.url}` }),
+      signal: AbortSignal.timeout(20000),
+    });
+    const odp = await res.json().catch(() => ({}));
+    rec.zamkniete_karty = (odp.zamkniete || []).filter((z) => z.ok).map((z) => z.id);
+    await env.SHIM.put(`post:${rec.id}`, JSON.stringify(rec));
+    if (rec.zamkniete_karty.length) return;
+    if (!res.ok) console.error('skrzynka zamknij HTTP', res.status, JSON.stringify(odp).slice(0, 300));
+  } catch (e) {
+    console.error('skrzynka zamknij', e);
+  }
+  await zglosDoSkrzynki(c, rec, 'publikacja');
 }
 
 /** Karta w skrzynce (wtyczka „przypomnienia”, nadawca wp-shim): link do artykułu i do panelu, przycisk „OK”. */
