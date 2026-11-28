@@ -21,8 +21,15 @@ SITE_TITLE = "Siechnice.com.pl"
 WP_USER = "linkhouse"
 # Adres artykułu w Bolcie; {slug} i {id} są podmieniane.
 POST_URL_TEMPLATE = "https://siechnice.com.pl/news/{slug}"
-# "false" = etap rozpoznania: wpis zapisany, publikacja odrzucona (503).
-ACCEPT_PUBLISH = "false"
+# "true" = etap 2: wpis „publish” od razu jako aktualność w Bolcie (MCP strony, kategoria BOLT_CATEGORY)
+# + karta w skrzynce. Działa tylko z sekretem SITE_MCP_TOKEN; bez niego jak etap 1 (zapis + 503).
+ACCEPT_PUBLISH = "true"
+SITE_MCP_URL = "https://siechnice.com.pl/mcp"
+BOLT_CATEGORY = "artykul-sponsorowany"
+# Podpis zdjęcia, gdy platforma nie przyśle własnego (Linkhouse nie przysyła).
+IMAGE_CREDIT = "mat. partnera"
+SKRZYNKA_URL = "https://skrzynka.siechnice.com.pl"
+PLATFORM_NAME = "Linkhouse"
 # "all" = loguj wszystko, "auth" = tylko żądania z loginem (mniej śmieci od botów)
 LOG_MODE = "all"
 # Kategorie pokazywane platformom (id muszą być liczbami).
@@ -31,4 +38,5 @@ CATEGORIES = '[{"id":1,"name":"Aktualności","slug":"aktualnosci"},{"id":2,"name
 # UWAGA: przy każdym wdrożeniu z GitHuba te [vars] nadpisują zmienne z panelu,
 # więc zmieniaj je tutaj, w repozytorium.
 # Sekrety ustaw w panelu (Settings → Variables and Secrets → typ Secret),
-# deploy ich nie rusza: WP_APP_PASSWORD, ADMIN_TOKEN
+# deploy ich nie rusza: WP_APP_PASSWORD, ADMIN_TOKEN, SITE_MCP_TOKEN (token usługi „wp_shim” z mcp_tokens strony),
+# SKRZYNKA_TOKEN (= NADAWCA_WPSHIM_TOKEN skrzynki)

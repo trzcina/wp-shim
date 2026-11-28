@@ -1,9 +1,15 @@
 /**
- * WP-shim dla siechnice.com.pl (Bolt 3) — ETAP 1: rozpoznanie.
+ * WP-shim dla siechnice.com.pl (Bolt 3).
  *
  * Udaje REST API WordPressa (wp/v2 + hasła aplikacji / Basic Auth) na tyle,
  * żeby Linkhouse i WhitePress mogły się podłączyć. Każde żądanie loguje do KV,
- * wpisy i media zapisuje w KV, ale NICZEGO nie publikuje w Bolcie.
+ * wpisy i media zapisuje w KV.
+ *
+ * ETAP 2 (ACCEPT_PUBLISH=true + sekret SITE_MCP_TOKEN): wpis ze statusem „publish”/„future” od razu
+ * staje się opublikowaną aktualnością w Bolcie (create_news przez MCP strony, kategoria BOLT_CATEGORY,
+ * zdjęcie wyróżnione przez prepare_upload), platforma dostaje prawdziwy adres artykułu, a do skrzynki
+ * idzie karta (link do artykułu i do panelu, gdzie można go wycofać). Późniejsze zmiany i usunięcie
+ * wpisu przez platformę NIE ruszają Bolta — tylko karta w skrzynce. Szkice zostają w KV.
  *
  * Panel podglądu (wymaga ?token=ADMIN_TOKEN):
  *   /wp-json/__shim/logs            ostatnie żądania (skrót)
@@ -58,7 +64,7 @@ async function handleApi(request, env, ctx, url) {
   const auth = checkAuth(request, env);
   const body = await parseBody(buf, ct);
 
-  const c = { request, env, url, site, route, method, ct, buf, auth, file: body.file, params: { ...queryObj(url), ...body.fields } };
+  const c = { request, env, ctx, url, site, route, method, ct, buf, auth, file: body.file, params: { ...queryObj(url), ...body.fields } };
   const response = await routeRest(c);
 
   if (env.LOG_MODE !== 'auth' || auth.present) {
@@ -375,6 +381,14 @@ async function postItem(c, id) {
   if (denied) return denied;
 
   if (['POST', 'PUT', 'PATCH'].includes(method)) {
+    if (rec.bolt) {
+      // Już w Bolcie: zmian z platformy nie przenosimy automatycznie (opublikowany tekst zmienia człowiek).
+      rec.edits_ignored = (rec.edits_ignored || 0) + 1;
+      rec.last_edit = { at: new Date().toISOString(), fields: Object.keys(params) };
+      await env.SHIM.put(`post:${id}`, JSON.stringify(rec));
+      if (rec.edits_ignored === 1) c.ctx.waitUntil(zglosDoSkrzynki(c, rec, 'edycja').catch((e) => console.error('skrzynka', e)));
+      return json(postView(rec, c));
+    }
     const oldSlug = rec.slug;
     applyPostFields(rec, params);
     if (params.slug !== undefined) rec.slug = await uniqueSlug(env, slugify(params.slug), id);
@@ -386,6 +400,13 @@ async function postItem(c, id) {
   }
   if (method === 'DELETE') {
     const view = postView(rec, c);
+    if (rec.bolt) {
+      // Artykuł w Bolcie zostaje — o usunięciu decyduje człowiek (karta w skrzynce).
+      rec.status = 'trash';
+      await env.SHIM.put(`post:${id}`, JSON.stringify(rec));
+      c.ctx.waitUntil(zglosDoSkrzynki(c, rec, 'usuniecie').catch((e) => console.error('skrzynka', e)));
+      return json(String(params.force) === 'true' || params.force === true ? { deleted: true, previous: view } : postView(rec, c));
+    }
     if (String(params.force) === 'true' || params.force === true) {
       await env.SHIM.delete(`post:${id}`);
       await env.SHIM.delete(`slug:${rec.slug}`);
@@ -424,7 +445,29 @@ function applyPostFields(rec, p) {
 async function savePostAndRespond(c, rec, okStatus) {
   const { env } = c;
   const wantsPublic = ['publish', 'future'].includes(rec.status);
-  if (wantsPublic && env.ACCEPT_PUBLISH !== 'true') {
+  if (wantsPublic && env.ACCEPT_PUBLISH === 'true' && env.SITE_MCP_TOKEN) {
+    // Etap 2: od razu artykuł w Bolcie (kategoria sponsorowana), potem karta w skrzynce.
+    // „future” (zaplanowane) też publikujemy od razu — Bolt przez MCP nie planuje publikacji.
+    try {
+      rec.bolt = await publikujWBolcie(c, rec);
+    } catch (e) {
+      rec.requested_status = rec.status;
+      rec.status = 'pending';
+      rec.bolt_error = String(e && e.message ? e.message : e).slice(0, 500);
+      await storePost(env, rec);
+      c.ctx.waitUntil(zglosDoSkrzynki(c, rec, 'blad').catch((err) => console.error('skrzynka', err)));
+      return wpError('shim_publish_failed', `Nie udało się opublikować (ID ${rec.id}): ${rec.bolt_error}`, 502, { post_id: rec.id });
+    }
+    rec.requested_status = rec.status;
+    rec.status = 'publish';
+    delete rec.bolt_error;
+    await storePost(env, rec);
+    c.ctx.waitUntil(zglosDoSkrzynki(c, rec, 'publikacja').catch((e) => console.error('skrzynka', e)));
+    const view = postView(rec, c);
+    return json(view, okStatus, okStatus === 201 ? { Location: `${c.site}/wp-json/wp/v2/posts/${rec.id}` } : {});
+  }
+  if (wantsPublic && rec.bolt) return json(postView(rec, c), okStatus);
+  if (wantsPublic) {
     // Etap rozpoznania: treść zapisujemy, ale nie udajemy publikacji,
     // żeby platforma nie zgłosiła adresu, pod którym jeszcze nic nie ma.
     rec.requested_status = rec.status;
@@ -454,7 +497,7 @@ function postLink(slug, id, c) {
 
 function postView(r, c) {
   const isPublic = ['publish', 'future', 'private'].includes(r.status);
-  const link = isPublic ? postLink(r.slug, r.id, c) : `${c.site}/?p=${r.id}`;
+  const link = r.bolt && r.bolt.url ? r.bolt.url : isPublic ? postLink(r.slug, r.id, c) : `${c.site}/?p=${r.id}`;
   return {
     id: r.id,
     date: r.date,
@@ -499,6 +542,151 @@ async function uniqueSlug(env, slug, id) {
 function normStatus(s) {
   const v = String(s || 'draft').toLowerCase();
   return ['publish', 'future', 'draft', 'pending', 'private'].includes(v) ? v : 'draft';
+}
+
+/* ------------------------------------------------------------------ */
+/* Etap 2: publikacja w Bolcie (MCP strony) i karta w skrzynce           */
+/* ------------------------------------------------------------------ */
+
+/** Narzędzie MCP strony (token usługi z mcp_tokens: create_news, prepare_upload). */
+async function siteTool(env, name, args) {
+  const res = await fetch(env.SITE_MCP_URL || 'https://siechnice.com.pl/mcp', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${env.SITE_MCP_TOKEN}`, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+    signal: AbortSignal.timeout(25000),
+  });
+  if (res.status === 401) throw new Error('strona odrzuciła token MCP (401)');
+  if (!res.ok) throw new Error(`strona: HTTP ${res.status} przy ${name}`);
+  const body = await res.json();
+  if (body.error) throw new Error(`strona: ${body.error.message || 'błąd wywołania'}`);
+  const data = (body.result && body.result.structuredContent) || {};
+  if (body.result && body.result.isError) throw new Error(`strona: ${data.error || (body.result.content && body.result.content[0] && body.result.content[0].text) || 'błąd narzędzia'}`);
+  return data;
+}
+
+/** Usuwa śmieci edytorów (dir, data-*, class) — reszta HTML idzie do sanitizera Bolta. */
+function oczyscHtml(html) {
+  return String(html || '')
+    .replace(/\s(?:dir|class|data-[\w-]+)=("[^"]*"|'[^']*')/gi, '')
+    .replace(/<p>\s*(?:&nbsp;|\s)*<\/p>/gi, '')
+    .trim();
+}
+
+/** Wstęp = excerpt albo pierwszy akapit treści (wtedy wycięty z treści, żeby się nie powtarzał). */
+function wstepITresc(rec) {
+  const tresc = oczyscHtml(rec.content);
+  const excerpt = oczyscHtml(rec.excerpt);
+  if (excerpt.replace(/<[^>]+>/g, '').trim()) return { teaser: excerpt.startsWith('<') ? excerpt : `<p>${excerpt}</p>`, body: tresc };
+  const m = tresc.match(/^\s*(<p>[\s\S]*?<\/p>)/i);
+  if (m) {
+    const reszta = tresc.slice(m[0].length).trim();
+    return { teaser: m[1], body: reszta || m[1] };
+  }
+  return { teaser: `<p>${escapeHtml(rec.title)}</p>`, body: tresc || `<p>${escapeHtml(rec.title)}</p>` };
+}
+
+const ROZSZERZENIA = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
+
+/** Zdjęcie wyróżnione z KV → pliki strony (podpisany link z prepare_upload). Zwraca ścieżkę albo null. */
+async function wgrajZdjecie(env, mediaId) {
+  if (!mediaId) return null;
+  const meta = await env.SHIM.get(`media:${mediaId}`, 'json');
+  const bytes = await env.SHIM.get(`mediafile:${mediaId}`, 'arrayBuffer');
+  if (!meta || !bytes) return null;
+  let mime = String(meta.mime || '').toLowerCase();
+  if (mime === 'image/jpg' || mime === 'image/pjpeg') mime = 'image/jpeg';
+  const ext = ROZSZERZENIA[mime];
+  if (!ext) return null;
+  const link = await siteTool(env, 'prepare_upload', {});
+  const uploadUrl = String(link.upload_url || '');
+  if (!/^https?:\/\//.test(uploadUrl)) throw new Error('strona nie dała linku do wgrania zdjęcia');
+  const nazwa = (meta.filename || 'zdjecie').replace(/\.[^.]+$/, '').slice(0, 80) + '.' + ext;
+  const form = new FormData();
+  form.append('file', new Blob([bytes], { type: mime }), nazwa);
+  const res = await fetch(uploadUrl, { method: 'POST', body: form, signal: AbortSignal.timeout(30000) });
+  const odp = await res.json().catch(() => ({}));
+  const sciezka = odp.files && odp.files[0] && odp.files[0].path;
+  if (!res.ok || !sciezka) throw new Error(`strona nie przyjęła zdjęcia: ${odp.error || (odp.errors || []).join('; ') || 'HTTP ' + res.status}`);
+  return { path: sciezka, alt: meta.alt_text || '', podpis: meta.caption ? rawText(meta.caption).replace(/<[^>]+>/g, '').trim() : '' };
+}
+
+/**
+ * Tworzy opublikowaną aktualność. Blokada na tytuł (10 min) chroni przed podwójną publikacją, gdy platforma
+ * ponowi żądanie po przekroczeniu czasu; ten sam tytuł w ciągu doby zwraca już opublikowany artykuł.
+ */
+async function publikujWBolcie(c, rec) {
+  const { env } = c;
+  const klucz = `pub:${slugify(rec.title).slice(0, 120)}`;
+  const byl = await env.SHIM.get(klucz, 'json');
+  if (byl && byl.url) return { ...byl, powtorka: true };
+  if (byl && byl.trwa) throw new Error('ten artykuł właśnie się publikuje — spróbuj za kilka minut');
+  await env.SHIM.put(klucz, JSON.stringify({ trwa: true }), { expirationTtl: 600 });
+  try {
+    const { teaser, body } = wstepITresc(rec);
+    const zdj = await wgrajZdjecie(env, rec.featured_media);
+    const podpis = (zdj && zdj.podpis) || env.IMAGE_CREDIT || '';
+    const r = await siteTool(env, 'create_news', {
+      title: String(rec.title).slice(0, 250),
+      teaser,
+      body,
+      categories: [env.BOLT_CATEGORY || 'artykul-sponsorowany'],
+      ...(zdj ? { image: { file: zdj.path, title: zdj.alt || rec.title } } : {}),
+      ...(podpis ? { imagecredentials: podpis } : {}),
+      publish: true,
+    });
+    const bolt = { id: r.id ?? null, url: typeof r.url === 'string' ? r.url : null, admin_url: typeof r.admin_url === 'string' ? r.admin_url : null, at: new Date().toISOString(), zdjecie: !!zdj };
+    if (!bolt.url) throw new Error('strona nie zwróciła adresu artykułu');
+    await env.SHIM.put(klucz, JSON.stringify(bolt), { expirationTtl: 86400 });
+    return bolt;
+  } catch (e) {
+    await env.SHIM.delete(klucz);
+    throw e;
+  }
+}
+
+/** Karta w skrzynce (wtyczka „przypomnienia”, nadawca wp-shim): link do artykułu i do panelu, przycisk „OK”. */
+async function zglosDoSkrzynki(c, rec, rodzaj) {
+  const { env } = c;
+  if (!env.SKRZYNKA_TOKEN) return;
+  const platforma = env.PLATFORM_NAME || 'Linkhouse';
+  const tytuly = {
+    publikacja: `${platforma}: opublikowano „${rec.title}”`,
+    blad: `${platforma}: NIE udało się opublikować „${rec.title}”`,
+    edycja: `${platforma} zmienia opublikowany artykuł „${rec.title}”`,
+    usuniecie: `${platforma} usunął wpis „${rec.title}”`,
+  };
+  const opisy = {
+    publikacja: `Artykuł sponsorowany jest już na stronie${rec.bolt && rec.bolt.zdjecie ? ' (ze zdjęciem)' : ' (bez zdjęcia — dodaj w panelu)'}. Sprawdź go; żeby wycofać, zmień status w panelu na „wstrzymany” albo „szkic”.`,
+    blad: `Platforma dostała błąd, więc może ponowić albo pokazać go klientowi. Powód: ${rec.bolt_error || '?'}. Treść jest w shimie (ID ${rec.id}).`,
+    edycja: 'Platforma przysłała zmiany do opublikowanego wpisu. Nie przeniesiono ich automatycznie — jeśli trzeba, popraw artykuł w panelu.',
+    usuniecie: 'Platforma usunęła wpis u siebie. Artykuł na stronie został — zdecyduj w panelu, czy go wycofać.',
+  };
+  const akcje = [];
+  if (rec.bolt && /^https:/.test(rec.bolt.url || '')) akcje.push({ type: 'Action.OpenUrl', title: 'Zobacz na stronie', url: rec.bolt.url });
+  if (rec.bolt && /^https:/.test(rec.bolt.admin_url || '')) akcje.push({ type: 'Action.OpenUrl', title: 'Edytuj / wycofaj w panelu', url: rec.bolt.admin_url });
+  akcje.push({ type: 'Action.Execute', verb: 'zrobione', title: 'OK', style: 'positive' });
+  const karta = {
+    type: 'AdaptiveCard',
+    version: '1.5',
+    body: [
+      { type: 'TextBlock', text: tytuly[rodzaj].slice(0, 200), weight: 'bolder', size: 'large', wrap: true },
+      { type: 'TextBlock', text: opisy[rodzaj], wrap: true },
+      { type: 'FactSet', facts: [
+        { title: 'Kategoria', value: env.BOLT_CATEGORY || 'artykul-sponsorowany' },
+        { title: 'Wpis w shimie', value: `ID ${rec.id}` },
+        ...(rec.bolt && rec.bolt.id ? [{ title: 'Aktualność', value: `#${rec.bolt.id}` }] : []),
+      ] },
+    ],
+    actions: akcje,
+  };
+  const res = await fetch((env.SKRZYNKA_URL || 'https://skrzynka.siechnice.com.pl') + '/api/zadania', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${env.SKRZYNKA_TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ wtyczka: 'przypomnienia', klucz: `${rodzaj}:${rec.id}`, karta, tagi: ['sponsorowane'] }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) console.error('skrzynka HTTP', res.status, (await res.text()).slice(0, 300));
 }
 
 /* ------------------------------------------------------------------ */
